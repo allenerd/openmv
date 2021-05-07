@@ -30,6 +30,7 @@ static volatile bool use_static_ip = false;
 static void *async_request_data;
 static uint8_t async_request_type=0;
 static volatile bool async_request_done = false;
+static volatile bool async_request_ack = false;
 static winc_ifconfig_t ifconfig;
 
 typedef struct {
@@ -91,8 +92,12 @@ static void socket_callback(SOCKET sock, uint8_t msg_type, void *msg)
     }
 
     if (async_request_type != msg_type) {
-        debug_printf("spurious message received!"
-                " expected: (%d) received: (%d)\n", async_request_type, msg_type);
+        if (msg_type == SOCKET_MSG_SEND) {
+            async_request_ack = true;
+        } else {
+            debug_printf("spurious message received!"
+                    " expected: (%d) received: (%d)\n", async_request_type, msg_type);
+        }
         return;
     }
 
@@ -418,17 +423,29 @@ static int winc_async_request(uint8_t msg_type, void *ret, uint32_t timeout)
     async_request_data = ret;
     async_request_done = false;
     async_request_type = msg_type;
+    async_request_ack = false;
+    uint32_t max_acks = 10;
     uint32_t tick_start = HAL_GetTick();
 
     // Wait for async request to finish.
     while (async_request_done == false) {
-        __WFI();
         // Handle pending events from network controller.
         m2m_wifi_handle_events(NULL);
+
+        if (async_request_ack == true && max_acks--) {
+            // Received an ACK from an older send/sendto() instead of the expected event.
+            // Reset the timeout and keep trying, for a max number of max_acks.
+            async_request_ack = false;
+            tick_start = HAL_GetTick();
+        }
+
         // timeout == 0 in blocking mode.
         if (timeout && ((HAL_GetTick() - tick_start) >= timeout)) {
             return SOCK_ERR_TIMEOUT;
         }
+
+        // Wait for the next IRQ.
+        __WFI();
     }
 
     return SOCK_ERR_NO_ERROR;
@@ -878,7 +895,7 @@ int winc_socket_recv(int fd, uint8_t *buf, uint32_t len, winc_socket_buf_t *sock
     if (sockbuf->size == 0) { // No buffered data.
         sockbuf->idx = 0; // Reset sockbuf index.
 
-        int recv_bytes;
+        int recv_bytes = 0;
         // Set recv to the maximum possible packet size.
         int ret = WINC1500_EXPORT(recv)(fd, sockbuf->buf, WINC_SOCKBUF_MAX_SIZE, timeout);
         if (ret == SOCK_ERR_NO_ERROR) {
